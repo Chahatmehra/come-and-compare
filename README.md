@@ -48,7 +48,7 @@ python artifacts/come-and-compare/app.py
 
 ## Setup (HuggingFace Space)
 
-1. Upload hf-space/ contents to a new Gradio Space
+1. Upload hf-space/ contents to a new Gradio Space  
 2. Add HF_TOKEN in Space Settings → Variables and secrets
 3. The app starts automatically — no other config needed
 
