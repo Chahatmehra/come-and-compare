@@ -8,14 +8,10 @@ from huggingface_hub import InferenceClient
 
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 PRICE_RE = re.compile(r"(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)")
-
-UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36",
-]
+ASIN_RE  = re.compile(r"/(?:dp|gp/product)/([A-Z0-9]{10})")
 
 DDG_HEADERS = {
-    "User-Agent": UA_LIST[0],
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
@@ -39,6 +35,41 @@ def clean_price(text: str):
         except ValueError:
             pass
     return None
+
+
+def clean_amazon_link(raw_link: str) -> str:
+    """Extract ASIN and return a clean, working Amazon.in product URL."""
+    if not raw_link:
+        return None
+    m = ASIN_RE.search(raw_link)
+    if m:
+        return f"https://www.amazon.in/dp/{m.group(1)}"
+    # If no ASIN, keep only the base path (strip all query params/tracking)
+    try:
+        parsed = urllib.parse.urlparse(raw_link)
+        if "amazon" in parsed.netloc:
+            clean = parsed._replace(query="", fragment="").geturl()
+            return clean
+    except Exception:
+        pass
+    return raw_link
+
+
+def clean_flipkart_link(raw_link: str) -> str:
+    """Keep only essential Flipkart URL params, strip tracking."""
+    if not raw_link:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(raw_link)
+        qs = urllib.parse.parse_qs(parsed.query)
+        kept = {}
+        for k in ("pid", "lid", "marketplace"):
+            if k in qs:
+                kept[k] = qs[k]
+        new_q = urllib.parse.urlencode(kept, doseq=True)
+        return parsed._replace(query=new_q, fragment="").geturl()
+    except Exception:
+        return raw_link
 
 
 def ddg_search(query: str, num: int = 12):
@@ -181,13 +212,25 @@ def hf_ai_analysis(query: str, amazon: dict, flipkart: dict, myntra: dict) -> st
         return f"⚠️ AI analysis unavailable: {str(e)}"
 
 
-def get_platform_link(results, domain: str):
+def get_platform_link(results, domain: str, platform: str):
+    """Return a clean, working link for the platform."""
     for r in results:
-        if domain in r.get("url", "") or domain in r.get("link", ""):
-            link = r["link"]
-            if not link.startswith("http"):
-                link = "https://" + r["url"]
-            return link
+        url  = r.get("url", "")
+        link = r.get("link", "")
+        if domain in url or domain in link:
+            raw = link if link.startswith("http") else ("https://" + url if url else None)
+            if not raw:
+                continue
+            if platform == "Amazon.in":
+                cleaned = clean_amazon_link(raw)
+                if cleaned:
+                    return cleaned
+            elif platform == "Flipkart":
+                cleaned = clean_flipkart_link(raw)
+                if cleaned:
+                    return cleaned
+            else:
+                return raw
     return None
 
 
@@ -239,7 +282,7 @@ def get_product_image(query: str, ddg_results: list):
 def compare_prices(product_name, product_details, selected_platforms, progress=gr.Progress()):
     if not product_name or not product_name.strip():
         return (
-            "<p style='color:#e53935;text-align:center;padding:20px'>⚠️ Please enter a product name.</p>",
+            "<p style='color:#c62828;text-align:center;padding:20px;font-size:15px'>⚠️ Please enter a product name.</p>",
             "❌ No product entered.",
             "",
         )
@@ -262,10 +305,14 @@ def compare_prices(product_name, product_details, selected_platforms, progress=g
 
     progress(0.85, desc="🤖 Running AI analysis...")
 
+    enc = urllib.parse.quote_plus(normalized)
     PLATFORMS = [
-        {"platform": "Amazon.in", "domain": "amazon.in",    "color": "#FF9900", "url_base": "https://www.amazon.in",    "search": f"https://www.amazon.in/s?k={normalized.replace(' ','+')}",    "price_key": "amazon"},
-        {"platform": "Flipkart",   "domain": "flipkart.com", "color": "#2874F0", "url_base": "https://www.flipkart.com", "search": f"https://www.flipkart.com/search?q={normalized.replace(' ','+')}","price_key": "flipkart"},
-        {"platform": "Myntra",     "domain": "myntra.com",   "color": "#FF3F6C", "url_base": "https://www.myntra.com",   "search": f"https://www.myntra.com/{normalized.replace(' ','+')}",          "price_key": "myntra"},
+        {"platform": "Amazon.in", "domain": "amazon.in",    "color": "#FF9900", "bg": "#FFF8EE",
+         "search": f"https://www.amazon.in/s?k={enc}", "price_key": "amazon"},
+        {"platform": "Flipkart",   "domain": "flipkart.com", "color": "#2874F0", "bg": "#EEF4FF",
+         "search": f"https://www.flipkart.com/search?q={enc}", "price_key": "flipkart"},
+        {"platform": "Myntra",     "domain": "myntra.com",   "color": "#FF3F6C", "bg": "#FFF0F4",
+         "search": f"https://www.myntra.com/{enc}", "price_key": "myntra"},
     ]
 
     active_keys = {p.lower(): p for p in (selected_platforms or [])}
@@ -273,7 +320,7 @@ def compare_prices(product_name, product_details, selected_platforms, progress=g
     for p in PLATFORMS:
         if active_keys and not any(k in p["platform"].lower() for k in active_keys):
             continue
-        link  = get_platform_link(ddg_results, p["domain"]) or p["search"]
+        link  = get_platform_link(ddg_results, p["domain"], p["platform"]) or p["search"]
         title = get_platform_title(ddg_results, p["domain"])
         price = hf_prices.get(p["price_key"])
         results.append({**p, "price": price, "title": title, "link": link})
@@ -282,140 +329,228 @@ def compare_prices(product_name, product_details, selected_platforms, progress=g
 
     progress(1.0, desc="✅ Done!")
 
-    table_html = _build_table(results, image_url, normalized)
+    table_html = _build_cards(results, image_url, normalized)
     links_html = _build_links(normalized, results)
     return table_html, ai_out, links_html
 
 
-def _build_table(results, image_url, query):
-    rows = ""
-    for r in results:
-        price = r.get("price") or "Not Available"
-        color = r["color"]
-        p_color = color if r.get("price") else "#999"
-        title = (r.get("title") or "")[:70]
-        link  = r.get("link", "#")
-        view  = f'<a href="{link}" target="_blank" class="view-btn" style="border-color:{color};color:{color}">View →</a>' if link != "#" else ""
-        rows += f"""<tr>
-            <td><span class="platform-badge" style="border-color:{color};color:{color}">{r['platform']}</span></td>
-            <td style="color:{p_color};font-weight:700;font-size:1.1em">{price}</td>
-            <td class="product-title">{title}</td>
-            <td>{view}</td>
-        </tr>"""
+def _find_best(results):
+    found = [r for r in results if r.get("price")]
+    if not found:
+        return ""
+    def val(r):
+        return int(r["price"].replace("₹","").replace(",","").strip())
+    try:
+        return min(found, key=val)["platform"]
+    except Exception:
+        return ""
+
+
+def _build_cards(results, image_url, query):
+    best = _find_best(results)
 
     img_html = ""
     if image_url:
-        img_html = f'<div style="text-align:center;margin-bottom:20px"><img src="{image_url}" style="max-height:200px;max-width:280px;border-radius:12px;object-fit:contain;background:#fff;padding:8px" /></div>'
+        img_html = (
+            f'<div style="text-align:center;margin-bottom:24px">'
+            f'<img src="{image_url}" style="max-height:220px;max-width:300px;'
+            f'border-radius:16px;object-fit:contain;background:#fff;'
+            f'padding:12px;box-shadow:0 4px 20px rgba(0,0,0,.10)" /></div>'
+        )
+
+    cards = ""
+    for r in results:
+        color  = r["color"]
+        bg     = r["bg"]
+        price  = r.get("price")
+        title  = (r.get("title") or "")[:72]
+        link   = r.get("link", r["search"])
+        is_best = best and r["platform"] == best and price
+
+        border = f"3px solid {color}" if is_best else f"2px solid {color}33"
+        shadow = f"0 8px 28px {color}30" if is_best else "0 4px 16px rgba(0,0,0,.08)"
+        trophy = '<div style="position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:#FFD700;color:#333;border-radius:20px;padding:3px 14px;font-size:11px;font-weight:700;white-space:nowrap">🏆 BEST DEAL</div>' if is_best else ""
+
+        price_html = (
+            f'<div style="font-size:2rem;font-weight:800;color:{color};margin:10px 0 6px;letter-spacing:-0.5px">{price}</div>'
+            if price else
+            '<div style="font-size:1rem;color:#aaa;font-weight:500;margin:10px 0 6px">Not Available</div>'
+        )
+        title_html = f'<div style="font-size:11px;color:#666;margin-bottom:12px;line-height:1.4;min-height:28px">{title}</div>' if title else '<div style="min-height:28px"></div>'
+        btn_html = (
+            f'<a href="{link}" target="_blank" style="display:inline-block;background:{color};color:#fff;'
+            f'text-decoration:none;border-radius:50px;padding:8px 20px;font-size:13px;font-weight:600;'
+            f'margin-top:4px">View on {r["platform"]} →</a>'
+        ) if price else ""
+
+        cards += f'''
+        <div style="position:relative;background:{bg};border:{border};border-radius:20px;
+            padding:24px 18px 20px;text-align:center;flex:1;min-width:180px;max-width:240px;
+            box-shadow:{shadow};transition:transform .2s">
+            {trophy}
+            <div style="font-size:28px;margin-bottom:6px">{"🛒" if "Amazon" in r["platform"] else "🛍️" if "Flipkart" in r["platform"] else "👗"}</div>
+            <div style="font-size:16px;font-weight:700;color:{color}">{r["platform"]}</div>
+            {price_html}
+            {title_html}
+            {btn_html}
+        </div>'''
+
+    cards_row = f'<div style="display:flex;gap:16px;justify-content:center;flex-wrap:wrap;margin:8px 0">{cards}</div>'
 
     has_price = any(r.get("price") for r in results)
     no_token_warn = "" if has_price else (
-        "<div style='background:rgba(255,165,0,.1);border:1px solid rgba(255,165,0,.4);border-radius:10px;"
-        "padding:12px 16px;margin-bottom:14px;color:#FFD700;font-size:13px'>"
-        "⚠️ No prices found — make sure <b>HF_TOKEN</b> is set in Space Secrets "
-        "(Settings → Variables and secrets → New secret → <code>HF_TOKEN</code>)</div>"
+        '<div style="background:#FFF3CD;border:1px solid #FFC107;border-radius:12px;'
+        'padding:14px 18px;margin-bottom:18px;color:#856404;font-size:13px;text-align:center">'
+        '⚠️ No prices found — make sure <b>HF_TOKEN</b> is set in Space Secrets '
+        '(Settings → Variables and secrets)</div>'
     )
 
-    return f"""
-{no_token_warn}
-{img_html}
-<div class="results-container">
-    <h3 class="results-title">📦 Price Comparison — <em style="color:#aaa;font-weight:400">{query}</em></h3>
-    <table class="price-table">
-        <thead><tr><th>Platform</th><th>Price</th><th>Product Found</th><th>Link</th></tr></thead>
-        <tbody>{rows}</tbody>
-    </table>
-</div>"""
+    heading = (
+        f'<div style="text-align:center;margin-bottom:18px">'
+        f'<span style="background:#E3F2FD;color:#1565C0;border-radius:20px;'
+        f'padding:6px 18px;font-size:13px;font-weight:600">📦 Results for: {query}</span></div>'
+    )
+
+    return f"{no_token_warn}{heading}{img_html}{cards_row}"
 
 
 def _build_links(query, results):
-    q = query.replace(" ", "+")
+    q = urllib.parse.quote_plus(query)
     chips = "".join(
-        f'<a href="{r["search"]}" target="_blank" class="link-chip">{r["platform"]}</a>'
+        f'<a href="{r["search"]}" target="_blank" style="display:inline-block;'
+        f'background:#fff;border:1.5px solid {r["color"]};color:{r["color"]};'
+        f'border-radius:20px;padding:6px 16px;font-size:13px;font-weight:600;'
+        f'text-decoration:none;margin:4px">{r["platform"]}</a>'
         for r in results
     )
-    chips += f'<a href="https://www.google.com/search?q={q}&tbm=shop" target="_blank" class="link-chip">🌐 Google Shopping</a>'
-    return f'<div class="links-wrapper"><p style="color:#aaa;margin-bottom:8px">🔗 Open directly:</p>{chips}</div>'
+    chips += (
+        f'<a href="https://www.google.com/search?q={q}&tbm=shop" target="_blank" '
+        f'style="display:inline-block;background:#fff;border:1.5px solid #34A853;color:#34A853;'
+        f'border-radius:20px;padding:6px 16px;font-size:13px;font-weight:600;'
+        f'text-decoration:none;margin:4px">🌐 Google Shopping</a>'
+    )
+    return f'<div style="padding:14px 0 6px"><p style="color:#555;margin-bottom:10px;font-size:13px">🔗 Search directly on each platform:</p>{chips}</div>'
 
 
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:wght@300;400;500&display=swap');
-:root {
-    --bg: #0a0a0f; --surface: #13131a; --surface2: #1c1c28;
-    --accent: #ff6b35; --accent2: #00e5ff; --gold: #ffd700;
-    --text: #f0f0f5; --muted: #888; --border: rgba(255,255,255,0.08); --radius: 16px;
-}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
 *, *::before, *::after { box-sizing: border-box; }
+
 body, .gradio-container {
-    background: var(--bg) !important;
-    font-family: 'DM Sans', sans-serif !important;
-    color: var(--text) !important;
+    font-family: 'Inter', sans-serif !important;
+    background: linear-gradient(135deg, #E0F7FA 0%, #E8F5E9 40%, #E3F2FD 100%) !important;
+    min-height: 100vh;
 }
+
 .gradio-container { max-width: 1100px !important; margin: 0 auto !important; }
+
+/* Header */
 .app-header {
-    text-align: center; padding: 40px 20px 20px;
-    background: linear-gradient(135deg, #0d0d18 0%, #1a0a1e 50%, #0d1320 100%);
-    border-bottom: 1px solid var(--border);
+    text-align: center;
+    padding: 36px 24px 20px;
+    background: linear-gradient(135deg, #ffffff 0%, #F0FFFE 100%);
+    border-radius: 0 0 28px 28px;
+    box-shadow: 0 4px 24px rgba(0,150,136,.12);
+    margin-bottom: 20px;
 }
+
 .app-title {
-    font-family: 'Syne', sans-serif; font-size: clamp(2rem, 5vw, 3.5rem);
-    font-weight: 800; letter-spacing: -1px; margin: 0;
-    background: linear-gradient(135deg, #ff6b35 0%, #ffd700 40%, #00e5ff 100%);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    font-weight: 800;
+    letter-spacing: -1.5px;
+    margin: 0;
+    background: linear-gradient(90deg, #FF9900 0%, #00ACC1 50%, #43A047 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
 }
-.app-subtitle { font-size: 1rem; color: var(--muted); margin-top: 8px; }
-.app-badges { display: flex; gap: 8px; justify-content: center; margin-top: 14px; flex-wrap: wrap; }
-.badge { background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 4px 12px; font-size: .75rem; color: var(--muted); }
-label, .label-wrap { color: var(--text) !important; font-size: .9rem !important; }
+
+.app-subtitle { font-size: .95rem; color: #546E7A; margin-top: 8px; font-weight: 500; }
+
+.app-badges {
+    display: flex; gap: 8px; justify-content: center; margin-top: 14px; flex-wrap: wrap;
+}
+.badge {
+    background: linear-gradient(135deg, #E0F7FA, #E8F5E9);
+    border: 1px solid #B2DFDB;
+    border-radius: 20px; padding: 5px 14px;
+    font-size: .75rem; color: #00695C; font-weight: 600;
+}
+
+/* Input panel */
+label, .label-wrap { color: #263238 !important; font-weight: 600 !important; font-size: .9rem !important; }
+
 textarea, input[type=text] {
-    background: var(--surface2) !important; border: 1px solid var(--border) !important;
-    color: var(--text) !important; border-radius: 10px !important;
+    background: #ffffff !important;
+    border: 2px solid #B2DFDB !important;
+    color: #263238 !important;
+    border-radius: 12px !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 15px !important;
+    box-shadow: 0 2px 8px rgba(0,150,136,.06) !important;
 }
 textarea:focus, input[type=text]:focus {
-    border-color: var(--accent) !important; outline: none !important;
-    box-shadow: 0 0 0 3px rgba(255,107,53,.15) !important;
+    border-color: #00ACC1 !important;
+    outline: none !important;
+    box-shadow: 0 0 0 3px rgba(0,172,193,.15) !important;
 }
+
+/* Compare button */
 .compare-btn {
-    background: linear-gradient(135deg,#ff6b35,#ff4d1a) !important;
-    color: white !important; border: none !important; border-radius: 12px !important;
-    font-family: 'Syne', sans-serif !important; font-size: 1.05rem !important;
-    font-weight: 700 !important; padding: 14px 28px !important;
-    cursor: pointer !important; width: 100% !important; text-transform: uppercase !important;
+    background: linear-gradient(135deg, #00ACC1, #00897B) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 14px !important;
+    font-size: 1rem !important;
+    font-weight: 700 !important;
+    padding: 14px 28px !important;
+    cursor: pointer !important;
+    width: 100% !important;
+    box-shadow: 0 4px 18px rgba(0,172,193,.35) !important;
+    letter-spacing: .3px !important;
 }
-.results-container { padding: 8px 0; }
-.results-title { font-family: 'Syne', sans-serif; font-size: 1.1rem; color: var(--accent2); margin-bottom: 16px; }
-.price-table { width: 100%; border-collapse: collapse; font-size: .9rem; }
-.price-table thead th {
-    background: var(--surface2); color: var(--muted); padding: 10px 14px;
-    text-align: left; font-weight: 500; font-size: .8rem; text-transform: uppercase;
-    letter-spacing: .5px; border-bottom: 1px solid var(--border);
+.compare-btn:hover { filter: brightness(1.08) !important; }
+
+/* Tabs */
+.tab-nav button { color: #546E7A !important; font-weight: 600 !important; }
+.tab-nav button.selected { color: #00ACC1 !important; border-bottom-color: #00ACC1 !important; }
+
+/* AI output box */
+textarea[readonly] {
+    background: #F1FFFE !important;
+    border: 2px solid #B2EBF2 !important;
+    color: #263238 !important;
+    line-height: 1.7 !important;
 }
-.price-table tbody tr { border-bottom: 1px solid var(--border); transition: background .15s; }
-.price-table tbody tr:hover { background: var(--surface2); }
-.price-table td { padding: 12px 14px; color: var(--text); vertical-align: middle; }
-.platform-badge { border: 1px solid; border-radius: 8px; padding: 4px 10px; font-size: .85rem; white-space: nowrap; }
-.product-title { color: var(--muted); font-size: .82rem; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.view-btn { text-decoration: none !important; border: 1px solid; border-radius: 6px; padding: 4px 10px; font-size: .85rem; white-space: nowrap; transition: all .15s; }
-.view-btn:hover { opacity: .75; }
-.links-wrapper { padding: 16px 0 8px; }
-.link-chip {
-    display: inline-block; background: var(--surface2); border: 1px solid var(--border);
-    border-radius: 20px; padding: 6px 14px; color: var(--text); text-decoration: none;
-    font-size: .82rem; margin: 4px; transition: all .15s;
+
+/* Checkbox */
+.wrap-inner {
+    background: #ffffff !important;
+    border-radius: 12px !important;
+    border: 2px solid #B2DFDB !important;
 }
-.link-chip:hover { border-color: var(--accent); color: var(--accent); }
-.app-footer { text-align: center; padding: 24px; color: var(--muted); font-size: .8rem; border-top: 1px solid var(--border); margin-top: 20px; }
+
+/* Footer */
+.app-footer {
+    text-align: center; padding: 20px; color: #78909C;
+    font-size: .8rem; margin-top: 10px;
+    border-top: 1px solid #B2DFDB;
+}
+
+footer { display: none !important; }
 ::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: var(--surface); }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-track { background: #E0F7FA; }
+::-webkit-scrollbar-thumb { background: #80CBC4; border-radius: 3px; }
 """
 
 HEADER_HTML = """
 <div class="app-header">
-    <h1 class="app-title">Come &amp; Compare</h1>
-    <p class="app-subtitle">AI-powered real-time price comparison across Indian e-commerce platforms</p>
+    <h1 class="app-title">Come &amp; Compare 🛒</h1>
+    <p class="app-subtitle">AI-powered real-time price comparison across India's top e-commerce platforms</p>
     <div class="app-badges">
         <span class="badge">🤖 Qwen2.5-7B</span>
-        <span class="badge">⚡ ≤32B Parameters</span>
+        <span class="badge">⚡ Under 32B Parameters</span>
         <span class="badge">🇮🇳 Amazon · Flipkart · Myntra</span>
         <span class="badge">🏆 HF Small Models Hackathon</span>
     </div>
@@ -424,9 +559,9 @@ HEADER_HTML = """
 
 FOOTER_HTML = """
 <div class="app-footer">
-    Built for the HuggingFace Build Small Hackathon 2025 &nbsp;|&nbsp;
-    Model: Qwen/Qwen2.5-7B-Instruct (&lt;32B) &nbsp;|&nbsp;
-    Search: DuckDuckGo HTML (no API key needed)
+    Built for the HuggingFace Build Small Hackathon 2025 &nbsp;·&nbsp;
+    Model: Qwen/Qwen2.5-7B-Instruct (&lt;32B) &nbsp;·&nbsp;
+    Search: DuckDuckGo HTML
 </div>
 """
 
@@ -451,8 +586,8 @@ with gr.Blocks(css=CSS, title="Come & Compare — Price Comparison AI") as demo:
                 value=["Amazon.in", "Flipkart", "Myntra"],
                 label="Platforms to Search",
             )
-            compare_btn = gr.Button("⚡ Compare Prices Now", elem_classes=["compare-btn"])
-            gr.Markdown("""---\n**💡 Tips:** Be specific — include brand + model. Add size/color for clothing.""")
+            compare_btn = gr.Button("🔍 Compare Prices Now", elem_classes=["compare-btn"])
+            gr.Markdown("**💡 Tip:** Include brand + model for best results.")
 
         with gr.Column(scale=2):
             with gr.Tabs():
@@ -470,11 +605,11 @@ with gr.Blocks(css=CSS, title="Come & Compare — Price Comparison AI") as demo:
 
     gr.Examples(
         examples=[
-            ["iPhone 15 128GB",           "Apple, Black"],
-            ["Nike Air Force 1",           "White, Size 9 UK"],
-            ["Samsung 55 inch 4K TV",      "Smart TV"],
-            ["boAt Airdopes 141",          ""],
-            ["OnePlus Nord CE 4",          "8GB RAM 128GB"],
+            ["iPhone 15 128GB",      "Apple, Black"],
+            ["Nike Air Force 1",     "White, Size 9 UK"],
+            ["Samsung 55 inch 4K TV","Smart TV"],
+            ["boAt Airdopes 141",    ""],
+            ["OnePlus Nord CE 4",    "8GB RAM 128GB"],
         ],
         inputs=[product_name, product_details],
         label="🌟 Try these examples",
