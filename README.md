@@ -6,7 +6,7 @@ Built for the **HuggingFace Small Models Hackathon** — uses Qwen/Qwen2.5-7B-In
 
 ## Live Demo
 
-Try it on HuggingFace Spaces: https://huggingface.co/spaces/PHOENIXREBORNAGAIN/hackathon
+Try it on HuggingFace Spaces: https://huggingface.co/spaces/PHOENIXREBORNAGAIN/come-and-compare
 
 ## How it works
 
